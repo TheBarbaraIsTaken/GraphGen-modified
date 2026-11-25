@@ -30,6 +30,7 @@ from graphgen.operators import (
 from graphgen.utils import (
     async_to_sync_method,
     compute_content_hash,
+    detect_main_language,
     format_generation_results,
     logger,
 )
@@ -107,12 +108,30 @@ class GraphGen:
 
         # Step 2: Split chunks and filter existing ones
         assert isinstance(data, list) and isinstance(data[0], dict)
-        new_docs = {
-            compute_content_hash(doc["content"], prefix="doc-"): {
-                "content": doc["content"]
+        if split_config.get("prechunked"):
+            # efkg: the input is already chunked. Every record is one chunk:
+            # {"content": text, "chunk_id": id, "doc_id": id of its document}. No splitting; the
+            # given chunk_id is the chunk key, so every node's / edge's source_id is our chunk id.
+            new_docs, prechunks = {}, {}
+            for doc in data:
+                doc_id = str(doc.get("doc_id") or compute_content_hash(doc["content"], prefix="doc-"))
+                new_docs.setdefault(doc_id, []).append(doc["content"])
+                prechunks[str(doc["chunk_id"])] = {
+                    "content": doc["content"],
+                    "full_doc_id": doc_id,
+                    "length": len(self.tokenizer_instance.encode(doc["content"]))
+                    if self.tokenizer_instance
+                    else len(doc["content"]),
+                    "language": detect_main_language(doc["content"]),
+                }
+            new_docs = {k: {"content": "\n\n".join(v)} for k, v in new_docs.items()}
+        else:
+            new_docs = {
+                compute_content_hash(doc["content"], prefix="doc-"): {
+                    "content": doc["content"]
+                }
+                for doc in data
             }
-            for doc in data
-        }
         _add_doc_keys = await self.full_docs_storage.filter_keys(list(new_docs.keys()))
         new_docs = {k: v for k, v in new_docs.items() if k in _add_doc_keys}
 
@@ -121,13 +140,18 @@ class GraphGen:
             return
         logger.info("[New Docs] inserting %d docs", len(new_docs))
 
-        inserting_chunks = await chunk_documents(
-            new_docs,
-            split_config["chunk_size"],
-            split_config["chunk_overlap"],
-            self.tokenizer_instance,
-            self.progress_bar,
-        )
+        if split_config.get("prechunked"):
+            inserting_chunks = {
+                k: v for k, v in prechunks.items() if v["full_doc_id"] in new_docs
+            }
+        else:
+            inserting_chunks = await chunk_documents(
+                new_docs,
+                split_config["chunk_size"],
+                split_config["chunk_overlap"],
+                self.tokenizer_instance,
+                self.progress_bar,
+            )
 
         _add_chunk_keys = await self.text_chunks_storage.filter_keys(
             list(inserting_chunks.keys())
